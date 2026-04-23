@@ -15,7 +15,7 @@ def load_dataset(path="data/processed/songs_dataset.csv"):
     return df
 
 
-def recommend_songs(vibe, df, top_n=10):
+def recommend_songs(vibe, df, top_n=20):
     # embedding del usuario
     vibe_embedding = get_embedding(vibe)
     

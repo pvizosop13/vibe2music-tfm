@@ -15,6 +15,7 @@ df["text"] = df["name"] + " " + df["artist"]
 
 print("Generando embeddings...")
 df["embedding"] = df["text"].apply(get_embedding)
+df = df.drop_duplicates(subset=["name", "artist"])
 
 # Guardar dataset
 df.to_csv("data/processed/songs_dataset.csv", index=False)
