@@ -11,7 +11,7 @@ songs = get_all_liked_songs(sp)
 df = pd.DataFrame(songs)
 
 # Creamos texto representativo
-df["text"] = df["name"] + " " + df["artist"]
+df["text"] = df["name"] + " by " + df["artist"] + " genre music mood"
 
 print("Generando embeddings...")
 df["embedding"] = df["text"].apply(get_embedding)
