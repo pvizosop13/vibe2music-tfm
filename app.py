@@ -6,7 +6,7 @@ st.set_page_config(page_title="Vibe2Music", layout="centered")
 
 st.title("🎧 Vibe2Music")
 st.subheader("Convierte tu vibe en música")
-
+st.markdown("Escribe cómo te sientes o qué quieres escuchar, y te recomendaré canciones de TU biblioteca")
 # cargar dataset
 @st.cache_data
 def load_data():
