@@ -15,7 +15,7 @@ def load_dataset(path="data/processed/songs_dataset.csv"):
     return df
 
 
-def recommend_songs(vibe, df, top_n=20):
+"""def recommend_songs(vibe, df, top_n=20):
     # embedding del usuario
     vibe_embedding = get_embedding(vibe)
     
@@ -31,4 +31,28 @@ def recommend_songs(vibe, df, top_n=20):
     # ordenar
     recommendations = df.sort_values(by="similarity", ascending=False)
     
-    return recommendations[["name", "artist", "similarity"]].head(top_n)
+    return recommendations[["name", "artist", "similarity"]].head(top_n)"""
+
+def recommend_songs(vibe, df, top_n=10, max_per_artist=2):
+    vibe_embedding = get_embedding(vibe)
+    
+    song_embeddings = np.vstack(df["embedding"].values)
+    similarities = cosine_similarity([vibe_embedding], song_embeddings)[0]
+    
+    df["similarity"] = similarities
+    df_sorted = df.sort_values(by="similarity", ascending=False)
+    
+    recommendations = []
+    artist_count = {}
+    
+    for _, row in df_sorted.iterrows():
+        artist = row["artist"]
+        
+        if artist_count.get(artist, 0) < max_per_artist:
+            recommendations.append(row)
+            artist_count[artist] = artist_count.get(artist, 0) + 1
+        
+        if len(recommendations) >= top_n:
+            break
+    
+    return pd.DataFrame(recommendations)[["name", "artist", "similarity"]]
