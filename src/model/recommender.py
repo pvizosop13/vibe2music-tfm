@@ -1,18 +1,26 @@
 """
-src/model/recommender.py
+src/model/recommender.py  — v4 (normalización z-score)
 
 Sistema híbrido de recomendación musical con tres capas:
 
-  1. Similitud semántica  — embedding Sentence-BERT de la vibe vs. embedding
-     de cada canción. Captura el significado contextual de la descripción.
+  1. Similitud semántica  — embedding Sentence-BERT enriquecido con tags
+     de Last.fm y descriptores textuales de audio features.
 
-  2. Similitud acústica   — solo para canciones con audio features de Kaggle.
-     Compara un perfil numérico inferido de la vibe con las features reales.
+  2. Similitud acústica   — solo para canciones con features de Kaggle.
+     Compara perfil numérico inferido de la vibe con features reales.
 
-  3. Boost por tags       — para canciones sin features (fuente: Last.fm),
-     suma un bonus si los tags del artista coinciden con keywords de la vibe.
+  3. Boost por tags       — bonus para canciones Last.fm cuyo género
+     coincide con keywords de la vibe.
 
-Score final = w_sem * sim_semántica + w_ac * sim_acústica + boost_tags
+Problema corregido en v4:
+    Las similitudes semántica y acústica tienen distribuciones muy distintas
+    (acústica sistemáticamente más alta: 0.78-0.93 vs semántica 0.30-0.60).
+    Sin normalizar, el componente acústico domina el ranking aunque su peso
+    declarado sea menor. Se aplica z-score a cada componente antes de
+    ponderar, de forma que los pesos reflejen la intención real.
+
+Score = (w_sem * zscore(sim_sem) + w_ac * zscore(sim_ac) + w_tag * zscore(boost)) / sum(w)
+        convertido de vuelta a [0,1] para interpretabilidad.
 """
 
 import re
@@ -22,14 +30,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
 from src.features.embedding_model import get_embedding
 
-# ── Columnas de audio features ─────────────────────────────────────────────────
 AUDIO_FEATURE_COLS = [
     "danceability", "energy", "valence", "tempo",
     "acousticness", "instrumentalness", "speechiness",
     "liveness", "loudness",
 ]
 
-# ── Perfiles acústicos por keyword de vibe ─────────────────────────────────────
 VIBE_PROFILES = {
     "gym":       {"energy": 0.9, "tempo": 0.85, "valence": 0.65, "danceability": 0.7},
     "workout":   {"energy": 0.9, "tempo": 0.85, "valence": 0.6,  "danceability": 0.65},
@@ -74,12 +80,11 @@ VIBE_PROFILES = {
     "piano":     {"acousticness": 0.85,"instrumentalness": 0.7, "energy": 0.2},
 }
 
-# ── Mapa de tags Last.fm → keywords de vibe ────────────────────────────────────
 TAG_KEYWORD_MAP = {
     "pop":               ["pop", "party", "fiesta", "happy", "alegre"],
     "indie pop":         ["indie", "chill", "relax"],
     "indie":             ["indie", "chill", "relax", "night", "noche"],
-    "rock":              ["rock", "gym", "workout", "energy"],
+    "rock":              ["rock", "gym", "workout"],
     "electropop":        ["electro", "dance", "party", "fiesta", "gym"],
     "electronic":        ["electro", "dance", "gym", "workout"],
     "dance":             ["dance", "bailar", "party", "fiesta", "gym"],
@@ -103,22 +108,35 @@ TAG_KEYWORD_MAP = {
 }
 
 
-# ── Funciones auxiliares ────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def _parse_embedding(x) -> np.ndarray:
-    """
-    Parser robusto de embeddings que maneja todos los formatos posibles:
-      - numpy moderno: '[np.float64(0.1), np.float64(0.2), ...]'
-      - numpy str:     '[0.1 0.2 0.3]'
-      - lista python:  '[0.1, 0.2, 0.3]'
-    """
+    """Parser robusto para todos los formatos de embedding en CSV."""
     if isinstance(x, np.ndarray):
         return x
     s = str(x)
-    # Eliminar 'np.float64(...)' dejando solo el número
     s = re.sub(r'np\.float\d+\(([^)]+)\)', r'\1', s)
-    # Limpiar corchetes, reemplazar comas por espacios
     s = s.strip().strip('[]').replace(',', ' ')
     return np.fromstring(s, sep=' ')
+
+
+def _zscore(arr: np.ndarray) -> np.ndarray:
+    """
+    Z-score sobre el array completo (población = todas las canciones).
+    Permite comparar componentes con distribuciones muy distintas.
+    Devuelve array con media≈0 y std≈1.
+    """
+    std = arr.std()
+    if std < 1e-8:
+        return np.zeros_like(arr)
+    return (arr - arr.mean()) / std
+
+
+def _zscore_to_01(arr: np.ndarray) -> np.ndarray:
+    """Escala z-scores a [0,1] para interpretabilidad del score final."""
+    arr_min, arr_max = arr.min(), arr.max()
+    if arr_max - arr_min < 1e-8:
+        return np.full_like(arr, 0.5)
+    return (arr - arr_min) / (arr_max - arr_min)
 
 
 def _infer_acoustic_profile(vibe: str) -> dict | None:
@@ -130,8 +148,7 @@ def _infer_acoustic_profile(vibe: str) -> dict | None:
 
 
 def _compute_tag_boost(tags_str: str, vibe: str) -> float:
-    """Devuelve un valor 0.0–1.0 según relevancia de tags para la vibe."""
-    if not tags_str or not isinstance(tags_str, str):
+    if not tags_str or not isinstance(tags_str, str) or tags_str == "nan":
         return 0.0
     vibe_lower = vibe.lower()
     tags = [t.strip().lower() for t in tags_str.split(",")]
@@ -156,47 +173,52 @@ def _normalize_features(df: pd.DataFrame) -> tuple:
     return scaler.fit_transform(matrix), available
 
 
-# ── Carga del dataset ──────────────────────────────────────────────────────────
+# ── Carga ──────────────────────────────────────────────────────────────────────
 def load_dataset(path: str = "data/processed/songs_dataset_enriched.csv") -> pd.DataFrame:
     df = pd.read_csv(path)
-
-    # Parser robusto de embeddings
     df["embedding"] = df["embedding"].apply(_parse_embedding)
-
-    # Convertir audio features a float
     for col in AUDIO_FEATURE_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     if "lastfm_tags" not in df.columns:
         df["lastfm_tags"] = ""
     if "audio_source" not in df.columns:
         df["audio_source"] = "none"
-
     return df
 
 
-# ── Función principal de recomendación ────────────────────────────────────────
+# ── Recomendación ──────────────────────────────────────────────────────────────
 def recommend_songs(
     vibe: str,
     df: pd.DataFrame,
     top_n: int = 10,
     max_per_artist: int = 2,
-    weight_semantic: float = 0.55,
-    weight_acoustic: float = 0.35,
+    weight_semantic: float = 0.65,
+    weight_acoustic: float = 0.25,
     weight_tags: float = 0.10,
 ) -> pd.DataFrame:
     """
-    Genera recomendaciones híbridas combinando similitud semántica,
-    acústica (Kaggle) y boost por tags de género (Last.fm).
+    Genera recomendaciones híbridas con scores normalizados por z-score,
+    de forma que cada componente contribuya en la proporción real indicada
+    por sus pesos, independientemente de su escala absoluta.
+
+    Parámetros
+    ----------
+    vibe            : Descripción libre del usuario
+    df              : DataFrame cargado con load_dataset()
+    top_n           : Número de recomendaciones finales
+    max_per_artist  : Máximo canciones por artista (diversidad)
+    weight_semantic : Peso real de la similitud semántica (default 0.65)
+    weight_acoustic : Peso real de la similitud acústica  (default 0.25)
+    weight_tags     : Peso real del boost por tags        (default 0.10)
     """
 
-    # 1. Similitud semántica
+    # ── 1. Similitud semántica ─────────────────────────────────────────────────
     vibe_embedding = get_embedding(vibe)
     song_embeddings = np.vstack(df["embedding"].values)
     semantic_sim = cosine_similarity([vibe_embedding], song_embeddings)[0]
 
-    # 2. Similitud acústica (solo canciones con source=kaggle)
+    # ── 2. Similitud acústica (solo canciones con features de Kaggle) ──────────
     feature_matrix, available_features = _normalize_features(df)
     acoustic_sim = np.zeros(len(df))
     w_acoustic = weight_acoustic
@@ -209,35 +231,44 @@ def recommend_songs(
                 if feat in profile:
                     vibe_vector[i] = profile[feat]
             raw_acoustic = cosine_similarity([vibe_vector], feature_matrix)[0]
-            # Aplicar solo donde hay features reales de Kaggle
             has_kaggle = df["audio_source"].eq("kaggle").values
             acoustic_sim = raw_acoustic * has_kaggle
         else:
             w_acoustic = 0.0
 
-    # 3. Boost por tags Last.fm
+    # ── 3. Boost por tags Last.fm ──────────────────────────────────────────────
     tag_boost = np.array([
         _compute_tag_boost(str(row.get("lastfm_tags", "")), vibe)
         for _, row in df.iterrows()
     ])
 
-    # 4. Score final normalizado
+    # ── 4. Normalización z-score + score final ─────────────────────────────────
+    # Cada componente se normaliza independientemente (media=0, std=1)
+    # para que los pesos reflejen su contribución real al ranking.
+    sem_z  = _zscore(semantic_sim)
+    ac_z   = _zscore(acoustic_sim) if w_acoustic > 0 else np.zeros(len(df))
+    tag_z  = _zscore(tag_boost)    if tag_boost.std() > 1e-8 else tag_boost
+
     total_w = weight_semantic + w_acoustic + weight_tags
-    score = (
-        weight_semantic * semantic_sim +
-        w_acoustic      * acoustic_sim +
-        weight_tags     * tag_boost
+    score_z = (
+        weight_semantic * sem_z  +
+        w_acoustic      * ac_z   +
+        weight_tags     * tag_z
     ) / total_w
 
+    # Convertir a [0,1] para interpretabilidad
+    score_01 = _zscore_to_01(score_z)
+
+    # ── 5. Construir dataframe con scores ──────────────────────────────────────
     df = df.copy()
-    df["similarity"]          = score
-    df["similarity_semantic"] = semantic_sim
-    df["similarity_acoustic"] = acoustic_sim
+    df["similarity"]          = score_01
+    df["similarity_semantic"] = _zscore_to_01(sem_z)
+    df["similarity_acoustic"] = _zscore_to_01(ac_z) if w_acoustic > 0 else acoustic_sim
     df["tag_boost"]           = tag_boost
 
     df_sorted = df.sort_values(by="similarity", ascending=False)
 
-    # 5. Diversidad por artista
+    # ── 6. Diversidad por artista ──────────────────────────────────────────────
     recommendations = []
     artist_count = {}
     for _, row in df_sorted.iterrows():
