@@ -281,7 +281,8 @@ def recommend_songs(
 
     result_cols = ["name", "artist", "similarity", "audio_source",
                    "similarity_semantic", "similarity_acoustic", "tag_boost"]
-    for col in ["energy", "valence", "danceability", "tempo"]:
+    for col in ["energy", "valence", "danceability", "tempo",
+                "acousticness", "instrumentalness", "speechiness", "liveness"]:
         if col in df.columns:
             result_cols.append(col)
 
